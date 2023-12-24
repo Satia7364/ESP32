@@ -1,0 +1,281 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <ESPAsyncWebSrv.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+#define USE_SERIAL Serial
+#define WIFI_SSID "Wokwi-GUEST"
+#define WIFI_PASSWORD ""
+#define WIFI_CHANNEL 6
+
+const char *ntpServer = "ntp2.ntu.edu.tw";
+const long gmtOffset_sec = 8 * 3600;
+const int daylightOffset_sec = 0;
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, ntpServer, gmtOffset_sec);
+
+AsyncWebServer server(80);
+String waterdata[4] = { "", "", "", "" }; // 水庫資料陣列
+const char *reservoirs[4] = { "白河水庫", "烏山頭水庫", "曾文水庫", "南化水庫" }; // 水庫名稱陣列
+
+bool isReservoirSelected = false;
+DynamicJsonDocument doc(3072); // 將 doc 宣告在全域範圍
+
+float fullWaterLevelZengWen = 230.0;
+float limitWaterLevelZengWen = 202.5;
+float normalWaterLevelMaxZengWen = fullWaterLevelZengWen - 0.01;
+float normalWaterLevelMinZengWen = limitWaterLevelZengWen + 0.01;
+
+float fullWaterLevelBaiHe = 109.0;
+float limitWaterLevelBaiHe = 95.0;
+float normalWaterLevelMaxBaiHe = fullWaterLevelBaiHe - 0.01;
+float normalWaterLevelMinBaiHe = limitWaterLevelBaiHe + 0.01;
+
+float fullWaterLevelWuShanTou = 100.0;
+float limitWaterLevelWuShanTou = 80.0;
+float normalWaterLevelMaxWuShanTou = fullWaterLevelWuShanTou - 0.01;
+float normalWaterLevelMinWuShanTou = limitWaterLevelWuShanTou + 0.01;
+
+float fullWaterLevelNanHua = 180.0;
+float limitWaterLevelNanHua = 169.73;
+float normalWaterLevelMaxNanHua = fullWaterLevelNanHua - 0.01;
+float normalWaterLevelMinNanHua = limitWaterLevelNanHua + 0.01;
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+#define OLED_RESET -1    // Reset pin # (or -1 if sharing Arduino reset pin)
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+void setup() {
+  USE_SERIAL.begin(115200);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3c)) { // Address 0x3D for 128x64
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;)
+      ;
+  }
+
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+
+  pinMode(17, OUTPUT);
+  pinMode(18, OUTPUT);
+  pinMode(19, OUTPUT);
+  analogWrite(17, 0);
+  analogWrite(18, 0);
+  analogWrite(19, 0);
+
+  for (uint8_t t = 4; t > 0; t--) {
+    USE_SERIAL.printf("[SETUP] WAIT %d...\n", t);
+    USE_SERIAL.flush();
+    delay(1000);
+  }
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
+  Serial.print("連接到 WiFi ");
+  Serial.print(WIFI_SSID);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(100);
+    Serial.print(".");
+  }
+  Serial.println(" 連接成功！");
+
+  Serial.print("IP 地址: ");
+  Serial.println(WiFi.localIP());
+
+  timeClient.begin();
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head><meta charset='UTF-8'><style>body { background-color: #f0f0f0; text-align: center; }</style></head><body>";
+    html += "<h1 style='color: #333; font-size: 2em; line-height: 2em;'>水庫水情數據</h1>";
+
+    // 新增水庫選擇下拉式選單
+    html += "<form action='/' method='get'>";
+    html += "<label for='reservoir'>選擇水庫：</label>";
+    html += "<select name='reservoir' id='reservoir' onchange='this.form.submit()'>";
+    html += "<option value='' selected disabled hidden>請選擇水庫</option>";
+    for (int i = 0; i < 4; i++) {
+      html += "<option value='" + String(reservoirs[i]) + "'>" + String(reservoirs[i]) + "</option>";
+    }
+    html += "</select>";
+    html += "</form>";
+
+    // 取得選擇的水庫名稱
+    String selectedReservoirParam = request->arg("reservoir");
+
+    // 如果有選擇水庫，顯示該水庫的資料
+    if (!selectedReservoirParam.isEmpty()) {
+      isReservoirSelected = true;
+      for (int i = 0; i < 4; i++) {
+        if (selectedReservoirParam.equals(reservoirs[i])) {
+          // Display on OLED
+          display.clearDisplay();
+          display.setTextSize(1);
+          display.setTextColor(SSD1306_WHITE);
+          display.setCursor(0, 0);
+          if (i == 0) {
+            display.println("Baihe Reservoir");
+          } else if (i == 1) {
+            display.println("Wushantou Reservoir");
+          } else if (i == 2) {
+            display.println("Zengwen Reservoir");
+          } else if (i == 3) {
+            display.println("Nanhua Reservoir");
+          }
+          display.print("waterlevel = ");
+          display.println(doc[i]["waterLevel"].as<const char *>());
+          display.print("time = ");
+          display.println(timeClient.getFormattedTime());
+          display.display();
+
+          html += "<div style='font-size: 2em; line-height: 2em; color: #666;'>";
+          html += waterdata[i];
+          html += "</div>";
+
+          // 在選擇水庫後同步顯示到 serial console
+          String u1 = timeClient.getFormattedTime();
+          USE_SERIAL.print("水庫=");
+          USE_SERIAL.print(reservoirs[i]);
+          USE_SERIAL.print(", 水位=");
+          USE_SERIAL.print(doc[i]["waterLevel"].as<const char *>());
+          USE_SERIAL.print(" 公尺, 時間=");
+          USE_SERIAL.println(u1);
+
+          // 判斷水位狀態並顯示在網頁中
+          float currentWaterLevel = atof(doc[i]["waterLevel"].as<const char *>());
+          String waterStatus;
+
+          if (i == 0) // 白河水庫的水位判斷
+          {
+            if (currentWaterLevel >= fullWaterLevelBaiHe) {
+              waterStatus = "滿水位";
+            } else if (currentWaterLevel >= normalWaterLevelMinBaiHe && currentWaterLevel <= normalWaterLevelMaxBaiHe) {
+              waterStatus = "正常";
+            } else if (currentWaterLevel < limitWaterLevelBaiHe) {
+              waterStatus = "限水";
+            }
+          } else if (i == 1) // 烏山頭水庫的水位判斷
+          {
+            if (currentWaterLevel >= fullWaterLevelWuShanTou) {
+              waterStatus = "滿水位";
+            } else if (currentWaterLevel >= normalWaterLevelMinWuShanTou && currentWaterLevel <= normalWaterLevelMaxWuShanTou) {
+              waterStatus = "正常";
+            } else if (currentWaterLevel < limitWaterLevelWuShanTou) {
+              waterStatus = "限水";
+            }
+          } else if (i == 2) // 曾文水庫的水位判斷
+          {
+            if (currentWaterLevel >= fullWaterLevelZengWen) {
+              waterStatus = "滿水位";
+            } else if (currentWaterLevel >= normalWaterLevelMinZengWen && currentWaterLevel <= normalWaterLevelMaxZengWen) {
+              waterStatus = "正常";
+            } else if (currentWaterLevel < limitWaterLevelZengWen) {
+              waterStatus = "限水";
+            }
+          } else if (i == 3) // 南化水庫的水位判斷
+          {
+            if (currentWaterLevel >= fullWaterLevelNanHua) {
+              waterStatus = "滿水位";
+            } else if (currentWaterLevel >= normalWaterLevelMinNanHua && currentWaterLevel <= normalWaterLevelMaxNanHua) {
+              waterStatus = "正常";
+            } else if (currentWaterLevel < limitWaterLevelNanHua) {
+              waterStatus = "限水";
+            }
+          }
+
+          html += "<div style='font-size: 1.5em; line-height: 1.5em; color: #333;'>";
+          html += "水位狀態：" + waterStatus;
+          html += "</div>";
+
+          break;
+        }
+      }
+    } else {
+      isReservoirSelected = false;
+      html += "<p style='color: #FF0000;'>請選擇水庫</p>";
+    }
+
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  server.on("/all_reservoirs", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String jsonResponse = "[";
+
+    for (int i = 0; i < 4; i++) {
+      if (i > 0) {
+        jsonResponse += ",";
+      }
+
+      // 使用 `doc` 中的數據構建JSON字串
+      jsonResponse += "{";
+      jsonResponse += "\"reservoir\": \"" + String(reservoirs[i]) + "\",";
+      jsonResponse += "\"waterLevel\": \"" + String(doc[i]["waterLevel"].as<const char *>()) + "\",";
+      jsonResponse += "\"time\": \"" + String(timeClient.getFormattedTime()) + "\"";
+      jsonResponse += "}";
+    }
+
+    jsonResponse += "]";
+
+    request->send(200, "application/json", jsonResponse);
+  });
+
+  server.begin();
+}
+
+void loop() {
+  timeClient.update();
+
+  if ((WiFi.status() == WL_CONNECTED)) {
+    HTTPClient http;
+
+    USE_SERIAL.print("[HTTP] 開始...\n");
+    http.begin("https://testsoa.tainan.gov.tw/TubeApi/api/Reservoir/GetWaterRegime");
+
+    USE_SERIAL.print("[HTTP] GET...\n");
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+      USE_SERIAL.printf("[HTTP] GET... 狀態碼: %d\n", httpCode);
+
+      if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+
+        DeserializationError error = deserializeJson(doc, payload);
+
+        if (error) {
+          Serial.print("deserializeJson() 失敗: ");
+          Serial.println(error.c_str());
+          return;
+        }
+
+        if (isReservoirSelected) {
+          for (int i = 0; i < 4; i++) {
+            const char *reservoirName = doc[i]["reservoirName"];
+            const char *waterLevel = doc[i]["waterLevel"];
+
+            String wa = reservoirName;
+            String pa = waterLevel;
+            String u1 = timeClient.getFormattedTime();
+
+            waterdata[i] = "水庫=" + wa + ", 水位=" + pa + " 公尺, 時間=" + u1 + "\n";
+          }
+        }
+      } else {
+        USE_SERIAL.printf("[HTTP] GET... 失敗，錯誤: %s\n", http.errorToString(httpCode).c_str());
+      }
+
+      http.end();
+    }
+
+    delay(5000);
+  }
+}
